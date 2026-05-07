@@ -1,0 +1,842 @@
+# =========================
+# SABINA BOWLER HAT WORD CLOUDS
+# FINAL VERSION WITH
+# EMOTIONAL COLOR CODING
+# HAT SHAPE + EMOTION GRADIENT SHADOW
+# =========================
+
+ARTIST = "sabina"
+INCLUDE_CHORUS = False
+TOP_N = 15
+
+# -------------------------
+# gif speed control
+# -------------------------
+# SECONDS_PER_FRAME: how long each album frame is displayed in the GIF
+# 1.0 = fast, 2.0 = default, 3.0 = slow
+SECONDS_PER_FRAME = 1.0
+MILLISECONDS_PER_FRAME = int(SECONDS_PER_FRAME * 1000)
+
+# -------------------------
+# gif speed control
+# -------------------------
+# SECONDS_PER_FRAME: how long each album frame is displayed in the GIF
+# 2.0 = fast, 4.0 = default, 6.0 = slow
+SECONDS_PER_FRAME = 4.0
+
+BASE_DIR = "/Users/marianav/Library/Mobile Documents/com~apple~CloudDocs/Downloads/classes/ind_study/data_raw/lyrics_txt"
+
+# -------------------------
+# installs
+# -------------------------
+# !pip install wordcloud imageio pillow matplotlib
+
+# -------------------------
+# imports
+# -------------------------
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
+from matplotlib.patches import FancyBboxPatch
+import imageio.v2 as imageio
+import nltk
+
+from collections import Counter, defaultdict
+from nltk.corpus import stopwords
+from nltk.tokenize import sent_tokenize
+from wordcloud import WordCloud
+from PIL import Image, ImageDraw
+
+# -------------------------
+# nltk downloads
+# -------------------------
+nltk.download("stopwords")
+nltk.download("punkt")
+nltk.download("punkt_tab")
+
+# -------------------------
+# stopwords
+# -------------------------
+spanish_stopwords = set(stopwords.words("spanish"))
+
+custom_stopwords = {
+    "si", "no", "ya", "tan", "ser", "hacer", "así", "aquí",
+    "porque", "solo", "tras", "cada", "aunque", "va"
+}
+
+all_stopwords = spanish_stopwords.union(custom_stopwords)
+
+# -------------------------
+# output paths
+# -------------------------
+PROJECT_DIR = Path(BASE_DIR).parent
+OUTPUT_DIR = PROJECT_DIR / "sabina_wordcloud_outputs"
+PNG_DIR = OUTPUT_DIR / "pngs"
+GIF_PATH = OUTPUT_DIR / "sabina_album_wordclouds.gif"
+TREND_CSV = OUTPUT_DIR / "sabina_top15_trends.csv"
+TREND_NORMALIZED_CSV = OUTPUT_DIR / "sabina_top15_trends_normalized.csv"
+LEGEND_PATH = OUTPUT_DIR / "sabina_emotion_legend.png"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PNG_DIR.mkdir(parents=True, exist_ok=True)
+
+# -------------------------
+# load lyrics corpus
+# -------------------------
+def load_lyrics_corpus(base_dir, artist, album_year=None):
+    root = Path(base_dir) / artist
+
+    if album_year is not None:
+        root = root / str(album_year)
+
+    if not root.exists():
+        raise FileNotFoundError(f"Folder not found: {root}")
+
+    rows = []
+
+    for p in root.rglob("*.txt"):
+        text = p.read_text(encoding="utf-8", errors="replace")
+
+        filename = p.name
+        album = p.parent.name
+
+        m = re.match(r"^(\d+)_", filename)
+        track = int(m.group(1)) if m else None
+
+        song = (
+            re.sub(r"^\d+_", "", filename)
+            .replace(".txt", "")
+            .replace("_", " ")
+        )
+
+        rows.append({
+            "artist": artist,
+            "album_year": album,
+            "track": track,
+            "song": song,
+            "filename": filename,
+            "text_raw": text
+        })
+
+    if not rows:
+        raise ValueError(f"No .txt files found in {root}")
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["album_year", "track"]).reset_index(drop=True)
+    return df
+
+# -------------------------
+# cleaning helpers
+# -------------------------
+def remove_song_headers(text):
+    text = re.sub(r"^\s*\[.*?\]\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    return text
+
+def normalize_text(text):
+    text = text.lower()
+    text = re.sub(r"[^a-záéíóúüñ\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def tokenize_and_remove_stopwords(text, min_len=2):
+    tokens = text.split()
+    tokens = [
+        t for t in tokens
+        if t not in all_stopwords and len(t) >= min_len
+    ]
+    return tokens
+
+# -------------------------
+# low-information line removal
+# -------------------------
+def _normalize_line_for_match(line):
+    line = line.strip().lower()
+    line = re.sub(r"[^a-záéíóúüñ\s]", "", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+def _is_low_information_line(line):
+    norm = _normalize_line_for_match(line)
+
+    if not norm:
+        return False
+
+    tokens = norm.split()
+    if not tokens:
+        return False
+
+    short_tokens = [t for t in tokens if len(t) <= 3]
+    short_ratio = len(short_tokens) / len(tokens)
+
+    if short_ratio >= 0.8:
+        return True
+
+    counts = Counter(tokens)
+    most_common = counts.most_common(1)[0][1]
+    if most_common / len(tokens) >= 0.8:
+        return True
+
+    if re.search(r"(.)\1{4,}", norm):
+        return True
+
+    chars = [c for c in norm if c != " "]
+    if len(chars) >= 6 and len(set(chars)) <= 4:
+        return True
+
+    return False
+
+def remove_low_information_lines(text):
+    lines = text.splitlines()
+    cleaned = []
+
+    for line in lines:
+        if not _is_low_information_line(line):
+            cleaned.append(line)
+
+    out = "\n".join(cleaned)
+    out = re.sub(r"\n{2,}", "\n", out).strip()
+    return out
+
+# -------------------------
+# chorus detection/removal
+# -------------------------
+def normalize_line_soft(line):
+    line = line.strip().lower()
+    line = re.sub(r"[^\wáéíóúüñ\s]", "", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+def get_nonempty_lines(text):
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+def find_repeated_lines(text, min_line_len=12, min_repeats=2, min_gap=2):
+    lines = get_nonempty_lines(text)
+    norm_lines = [normalize_line_soft(line) for line in lines]
+
+    positions = defaultdict(list)
+
+    for i, norm in enumerate(norm_lines):
+        if len(norm) >= min_line_len:
+            positions[norm].append(i)
+
+    chorus_lines = set()
+
+    for norm, idxs in positions.items():
+        if len(idxs) >= min_repeats:
+            gaps = [idxs[j + 1] - idxs[j] for j in range(len(idxs) - 1)]
+            if any(gap >= min_gap for gap in gaps):
+                chorus_lines.add(norm)
+
+    return chorus_lines
+
+def find_repeated_blocks(text, block_size=2, min_repeats=2, min_line_len=8):
+    lines = get_nonempty_lines(text)
+    norm_lines = [normalize_line_soft(line) for line in lines]
+
+    blocks = []
+    for i in range(len(norm_lines) - block_size + 1):
+        block = tuple(norm_lines[i:i + block_size])
+        if all(len(line) >= min_line_len for line in block):
+            blocks.append((i, block))
+
+    counts = Counter(block for _, block in blocks)
+    repeated_blocks = {block for block, c in counts.items() if c >= min_repeats}
+
+    return repeated_blocks
+
+def remove_chorus_lines_and_blocks(text, remove_blocks=True):
+    lines = get_nonempty_lines(text)
+    norm_lines = [normalize_line_soft(line) for line in lines]
+
+    repeated_lines = find_repeated_lines(text)
+    repeated_2blocks = find_repeated_blocks(text, block_size=2) if remove_blocks else set()
+    repeated_3blocks = find_repeated_blocks(text, block_size=3) if remove_blocks else set()
+
+    keep = [True] * len(lines)
+
+    for i, norm in enumerate(norm_lines):
+        if norm in repeated_lines:
+            keep[i] = False
+
+    for i in range(len(norm_lines) - 1):
+        block2 = tuple(norm_lines[i:i + 2])
+        if block2 in repeated_2blocks:
+            keep[i] = False
+            keep[i + 1] = False
+
+    for i in range(len(norm_lines) - 2):
+        block3 = tuple(norm_lines[i:i + 3])
+        if block3 in repeated_3blocks:
+            keep[i] = False
+            keep[i + 1] = False
+            keep[i + 2] = False
+
+    cleaned_lines = [line for i, line in enumerate(lines) if keep[i]]
+    return "\n".join(cleaned_lines)
+
+# -------------------------
+# cached preparation
+# -------------------------
+_prepared_cache = {}
+
+def prepare_full_corpus(include_chorus=True):
+    key = f"full_{include_chorus}"
+    if key in _prepared_cache:
+        return _prepared_cache[key]
+
+    df = load_lyrics_corpus(BASE_DIR, ARTIST, album_year=None)
+
+    df["text_raw"] = df["text_raw"].apply(remove_song_headers)
+    df["text_raw"] = df["text_raw"].apply(remove_low_information_lines)
+
+    if not include_chorus:
+        df["text_raw"] = df["text_raw"].apply(remove_chorus_lines_and_blocks)
+
+    df["text_clean"] = df["text_raw"].apply(normalize_text)
+    df["tokens"] = df["text_clean"].apply(tokenize_and_remove_stopwords)
+    df["song_key"] = df["song"].apply(normalize_text)
+
+    _prepared_cache[key] = df
+    return df
+
+def prepare_album(year, include_chorus=True):
+    key = f"{year}_{include_chorus}"
+    if key in _prepared_cache:
+        return _prepared_cache[key]
+
+    df = load_lyrics_corpus(BASE_DIR, ARTIST, album_year=year)
+
+    df["text_raw"] = df["text_raw"].apply(remove_song_headers)
+    df["text_raw"] = df["text_raw"].apply(remove_low_information_lines)
+
+    if not include_chorus:
+        df["text_raw"] = df["text_raw"].apply(remove_chorus_lines_and_blocks)
+
+    df["text_clean"] = df["text_raw"].apply(normalize_text)
+    df["tokens"] = df["text_clean"].apply(tokenize_and_remove_stopwords)
+
+    _prepared_cache[key] = df
+    return df
+
+# -------------------------
+# frequency building
+# -------------------------
+def build_freqs_title_capped(df, max_per_song=3):
+    freqs = Counter()
+
+    for _, row in df.iterrows():
+        tokens = row["tokens"]
+        token_counts = Counter(tokens)
+
+        for word, count in token_counts.items():
+            freqs[word] += min(count, max_per_song)
+
+        title_words = set(normalize_text(row["song"]).split())
+        for tw in title_words:
+            if token_counts.get(tw, 0) > 1:
+                freqs[tw] -= (min(token_counts[tw], max_per_song) - 1)
+
+    return freqs
+
+def filter_to_top_words(freqs, top_words):
+    return {w: freqs.get(w, 0) for w in top_words}
+
+def normalize_freqs_against_full(album_freqs, full_freqs, top_words):
+    return {
+        w: (album_freqs.get(w, 0) / full_freqs[w]) if full_freqs.get(w, 0) > 0 else 0
+        for w in top_words
+    }
+
+# -------------------------
+# emotional tone mapping
+# -------------------------
+emotion_map = {
+    "amor":     "love",
+    "besos":    "love",
+    "cama":     "love",
+    "mujer":    "love",
+
+    "corazón":  "longing",
+    "nunca":    "longing",
+    "mañana":   "longing",
+
+    "vida":     "hope",
+    "siempre":  "hope",
+
+    "noche":    "melancholy",
+    "día":      "melancholy",
+
+    "dos":      "love",
+    "vez":      "longing",
+    "mientras": "melancholy",
+    "tres":     "melancholy",
+}
+
+# Richer, more saturated colors for better contrast against light green
+emotion_colors = {
+    "love":       "#c0407a",
+    "longing":    "#6b3daa",
+    "hope":       "#1e7a4a",
+    "melancholy": "#2e5f98",
+    "neutral":    "#4a4845",
+}
+
+def emotion_color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+    emotion = emotion_map.get(word, "neutral")
+    return emotion_colors.get(emotion, "#4a4845")
+
+# -------------------------
+# bowler hat dome mask
+# Words placed only inside the dome (above the hat band).
+# -------------------------
+def create_hat_mask(size=900):
+    """
+    Returns a numpy mask where 0 = word allowed, 255 = blocked.
+    Shape is the bowler hat dome only (no brim).
+    SVG reference viewBox: 680 wide.
+    Dome path from SVG coords:
+      M216,345 C210,318 210,290 210,262
+      C210,236 214,216 222,200
+      C232,184 268,174 340,174
+      C412,174 448,184 458,200
+      C466,216 470,236 470,262
+      C470,290 470,318 464,345
+      C436,352 392,357 340,357
+      C288,357 244,352 216,345 Z
+    Approximated as a polygon for PIL.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("L", (size, size), color=255)
+    draw = ImageDraw.Draw(img)
+
+    scale = size / 680
+
+    # Dense polygon approximating the dome curve
+    dome_pts_svg = [
+        (216, 345), (213, 330), (211, 315), (210, 300),
+        (210, 285), (210, 270), (210, 262),
+        (211, 252), (213, 242), (216, 232),
+        (219, 222), (222, 212), (226, 204),
+        (230, 196), (235, 189), (240, 184),
+        (248, 179), (258, 176), (268, 174),
+        (280, 174), (295, 174), (310, 174),
+        (325, 174), (340, 174),
+        (355, 174), (370, 174), (385, 174),
+        (400, 174), (412, 174),
+        (422, 176), (432, 179), (440, 184),
+        (445, 189), (450, 196), (454, 204),
+        (458, 212), (461, 222), (464, 232),
+        (467, 242), (469, 252), (470, 262),
+        (470, 270), (470, 285), (470, 300),
+        (469, 315), (467, 330), (464, 345),
+        (456, 349), (448, 352), (436, 354),
+        (422, 356), (408, 357), (392, 357),
+        (376, 357), (360, 357), (340, 357),
+        (320, 357), (304, 357), (288, 357),
+        (272, 356), (258, 355), (244, 352),
+        (232, 350), (224, 348), (216, 345),
+    ]
+
+    scaled = [(int(x * scale), int(y * scale)) for x, y in dome_pts_svg]
+    draw.polygon(scaled, fill=0)
+
+    return np.array(img)
+
+
+# -------------------------
+# hat background (dome + brim)
+# -------------------------
+def build_hat_background(size=900):
+    """
+    Returns an RGBA numpy array with the bowler hat drawn:
+    dome (dark felt) + brim (flat ellipse).
+    Background is transparent.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    scale = size / 680
+
+    # --- brim: flat ellipse at y=354, rx=195, ry=18 ---
+    brim_cx = int(340 * scale)
+    brim_cy = int(354 * scale)
+    brim_rx = int(195 * scale)
+    brim_ry = int(18 * scale)
+    draw.ellipse(
+        [brim_cx - brim_rx, brim_cy - brim_ry,
+         brim_cx + brim_rx, brim_cy + brim_ry],
+        fill=(28, 24, 20, 255)
+    )
+
+    # --- dome polygon ---
+    dome_pts_svg = [
+        (216, 345), (213, 330), (211, 315), (210, 300),
+        (210, 285), (210, 270), (210, 262),
+        (211, 252), (213, 242), (216, 232),
+        (219, 222), (222, 212), (226, 204),
+        (230, 196), (235, 189), (240, 184),
+        (248, 179), (258, 176), (268, 174),
+        (280, 174), (295, 174), (310, 174),
+        (325, 174), (340, 174),
+        (355, 174), (370, 174), (385, 174),
+        (400, 174), (412, 174),
+        (422, 176), (432, 179), (440, 184),
+        (445, 189), (450, 196), (454, 204),
+        (458, 212), (461, 222), (464, 232),
+        (467, 242), (469, 252), (470, 262),
+        (470, 270), (470, 285), (470, 300),
+        (469, 315), (467, 330), (464, 345),
+        (456, 349), (448, 352), (436, 354),
+        (422, 356), (408, 357), (392, 357),
+        (376, 357), (360, 357), (340, 357),
+        (320, 357), (304, 357), (288, 357),
+        (272, 356), (258, 355), (244, 352),
+        (232, 350), (224, 348), (216, 345),
+    ]
+    scaled = [(int(x * scale), int(y * scale)) for x, y in dome_pts_svg]
+    draw.polygon(scaled, fill=(28, 24, 20, 255))
+
+    # Apply smoothing filter to reduce polygon jaggedness
+    from PIL import ImageFilter
+    img = img.filter(ImageFilter.SMOOTH_MORE)
+
+    return np.array(img).astype(float) / 255.0
+
+
+# -------------------------
+# emotion gradient shadow
+# -------------------------
+def build_emotion_shadow(dominant_colors, size=900):
+    """
+    Returns an RGBA numpy array with a horizontal gradient ellipse
+    at the base of the hat, using the dominant emotion colors.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    # Build gradient strip
+    w = int(400 * size / 680)
+    h = int(20 * size / 680)
+    cx = size // 2
+    cy = int(430 * size / 680)
+
+    c0 = tuple(int(dominant_colors[0].lstrip("#")[i:i+2], 16) for i in (0,2,4))
+    c1 = tuple(int(dominant_colors[1].lstrip("#")[i:i+2], 16) for i in (0,2,4))
+    c2 = tuple(int(dominant_colors[2].lstrip("#")[i:i+2], 16) for i in (0,2,4))
+
+    strip = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    s_draw = ImageDraw.Draw(strip)
+    for x in range(w):
+        t = x / (w - 1)
+        if t < 0.35:
+            r = int(c0[0] + (c1[0]-c0[0]) * t/0.35)
+            g = int(c0[1] + (c1[1]-c0[1]) * t/0.35)
+            b = int(c0[2] + (c1[2]-c0[2]) * t/0.35)
+        elif t < 0.65:
+            r, g, b = c1
+        elif t < 0.85:
+            tt = (t-0.65)/0.20
+            r = int(c1[0] + (c2[0]-c1[0]) * tt)
+            g = int(c1[1] + (c2[1]-c1[1]) * tt)
+            b = int(c1[2] + (c2[2]-c1[2]) * tt)
+        else:
+            tt = (t-0.85)/0.15
+            r = int(c2[0] + (c0[0]-c2[0]) * tt)
+            g = int(c2[1] + (c0[1]-c2[1]) * tt)
+            b = int(c2[2] + (c0[2]-c2[2]) * tt)
+        alpha = int(140 * (1 - abs(2*t - 1)))  # fade at edges
+        s_draw.line([(x, 0), (x, h-1)], fill=(r, g, b, alpha))
+
+    # Paste as ellipse using strip as base
+    mask_ellipse = Image.new("L", (w, h), 0)
+    me_draw = ImageDraw.Draw(mask_ellipse)
+    me_draw.ellipse([0, 0, w-1, h-1], fill=255)
+    strip.putalpha(mask_ellipse)
+
+    img.paste(strip, (cx - w//2, cy - h//2), strip)
+    return np.array(img).astype(float) / 255.0
+
+
+# -------------------------
+# dominant emotion colors for trunk
+# -------------------------
+def get_dominant_trunk_colors(freqs, top_n=3):
+    """
+    Returns the hex colors of the top_n most frequent words,
+    in frequency order, for use in the trunk gradient.
+    Falls back to hope green if unmapped.
+    """
+    colors = []
+    for word, _ in sorted(freqs.items(), key=lambda x: -x[1]):
+        emotion = emotion_map.get(word, "neutral")
+        color = emotion_colors[emotion]
+        if color not in colors:
+            colors.append(color)
+        if len(colors) == top_n:
+            break
+    while len(colors) < 3:
+        colors.append(emotion_colors["neutral"])
+    return colors
+
+
+# -------------------------
+# word cloud plotting
+# -------------------------
+def make_wordcloud(freqs, title, mask, output_path=None, size=900):
+    from PIL import Image as PilImage
+    positive_freqs = {k: v for k, v in freqs.items() if v > 0}
+
+    if not positive_freqs:
+        print(f"Skipping {title}: no top words found.")
+        return
+
+    # --- word cloud clipped to hat dome ---
+    # Render at 2x size for sharpness, downsample for display
+    render_size = size * 4
+    mask_hires = create_hat_mask(size=render_size)
+    wc = WordCloud(
+        width=render_size,
+        height=render_size,
+        background_color=None,
+        mode="RGBA",
+        collocations=False,
+        mask=mask_hires,
+        prefer_horizontal=1.0,
+        margin=8,
+        random_state=42,
+        color_func=emotion_color_func,
+        font_path=None,
+        relative_scaling=0.55,
+    ).generate_from_frequencies(positive_freqs)
+
+    wc_arr_hires = wc.to_array()  # shape (render_size, render_size, 4)
+    # Downsample 2x -> size using PIL for antialiasing
+    wc_pil = PilImage.fromarray(wc_arr_hires)
+    wc_pil = wc_pil.resize((size, size), PilImage.LANCZOS)
+    wc_arr = np.array(wc_pil).astype(float) / 255.0   # RGBA, 0-1
+
+    # --- hat background (dome + brim) ---
+    # Build hat background at 2x for smoother edges, downsample
+    hat_bg_hires = build_hat_background(size=size * 4)
+    hat_bg_pil = PilImage.fromarray((hat_bg_hires * 255).astype(np.uint8))
+    hat_bg_pil = hat_bg_pil.resize((size, size), PilImage.LANCZOS)
+    hat_bg = np.array(hat_bg_pil).astype(float) / 255.0  # RGBA, 0-1
+
+    # Composite: hat background first, then word cloud on top
+    wc_alpha = wc_arr[..., 3:4]
+    composite = wc_arr * wc_alpha + hat_bg * (1 - wc_alpha)
+    composite = np.clip(composite, 0, 1)
+
+    # --- figure ---
+    fig, ax = plt.subplots(figsize=(9, 9), dpi=150)
+    ax.set_xlim(0, size)
+    ax.set_ylim(size, 0)
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+
+    # --- emotion gradient shadow — drawn with matplotlib for smooth antialiasing ---
+    dominant_colors = get_dominant_trunk_colors(positive_freqs, top_n=3)
+    scale = size / 680
+    shadow_cx = int(340 * scale)
+    shadow_cy = int(430 * scale)
+    shadow_rx = int(200 * scale)
+    shadow_ry = int(10  * scale)
+
+    # Build gradient as a horizontal imshow strip, clipped to an Ellipse patch
+    c0 = mcolors.to_rgb(dominant_colors[0])
+    c1 = mcolors.to_rgb(dominant_colors[1])
+    c2 = mcolors.to_rgb(dominant_colors[2])
+    grad_cmap = mcolors.LinearSegmentedColormap.from_list(
+        "shadow", [c0, c1, c1, c2, c0], N=512
+    )
+    grad_data = np.linspace(0, 1, 512).reshape(1, -1)
+    grad_img = ax.imshow(
+        grad_data,
+        cmap=grad_cmap,
+        aspect="auto",
+        extent=[shadow_cx - shadow_rx, shadow_cx + shadow_rx,
+                shadow_cy + shadow_ry, shadow_cy - shadow_ry],
+        alpha=0.55,
+        zorder=0,
+        interpolation="bilinear",
+    )
+    from matplotlib.patches import Ellipse as MplEllipse
+    clip_ellipse = MplEllipse(
+        (shadow_cx, shadow_cy),
+        width=shadow_rx * 2, height=shadow_ry * 2,
+        transform=ax.transData,
+    )
+    grad_img.set_clip_path(clip_ellipse)
+
+    # --- hat + words ---
+    ax.imshow(composite, extent=[0, size, size, 0], interpolation="bilinear", zorder=1)
+
+    # --- title: album name large on top, year smaller below ---
+    lines = title.split("\n")
+    ax.set_title(
+        lines[0],
+        fontsize=12, fontweight="normal", color="#8a8480",
+        pad=2, loc="center", fontfamily="serif",
+    )
+    if len(lines) > 1:
+        ax.text(
+            0.5, 1.038, lines[1],
+            transform=ax.transAxes,
+            fontsize=18, fontstyle="italic", color="#5a5853",
+            ha="center", va="bottom", fontfamily="serif",
+        )
+
+    # --- legend ---
+    order = ["love", "longing", "hope", "melancholy"]
+    patches = [
+        mpatches.Patch(color=emotion_colors[e], label=e.title())
+        for e in order
+    ]
+    ax.legend(
+        handles=patches,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.04),
+        ncol=len(order),
+        frameon=False,
+        fontsize=9,
+        handlelength=1,
+        handleheight=0.9,
+    )
+
+    plt.tight_layout()
+
+    if output_path is not None:
+        plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
+
+    plt.show()
+    plt.close()
+
+
+# -------------------------
+# preview hat mask
+# -------------------------
+mask = create_hat_mask(size=900)
+
+plt.figure(figsize=(6, 6))
+plt.imshow(mask, cmap="gray")
+plt.axis("off")
+plt.title("Hat Mask (dome only)")
+plt.show()
+
+
+# -------------------------
+# run analysis
+# -------------------------
+_prepared_cache.clear()
+
+full_df = prepare_full_corpus(include_chorus=INCLUDE_CHORUS)
+full_freqs = build_freqs_title_capped(full_df, max_per_song=3)
+
+top_words = [word for word, _ in full_freqs.most_common(TOP_N)]
+print("Top 15 words:", top_words)
+
+unmapped_words = [w for w in top_words if w not in emotion_map]
+print("Unmapped top words:", unmapped_words)
+
+# -------------------------
+# album title lookup
+# -------------------------
+ALBUM_TITLES = {
+    "1978": "Inventario",
+    "1980": "Malas Compañías",
+    "1983": "Ruleta Rusa",
+    "1984": "Ruleta Rusa",
+    "1985": "Juez y Parte",
+    "1987": "Hotel, Dulce Hotel",
+    "1988": "El Hombre del Traje Gris",
+    "1990": "Mentiras Piadosas",
+    "1992": "Física y Química",
+    "1994": "Esta Boca Es Mía",
+    "1996": "Yo, Mí, Me, Contigo",
+    "1999": "19 Días y 500 Noches",
+    "2000": "Calle Melancolía",
+    "2002": "Dímelo en la Calle",
+    "2005": "Alivio de Luto",
+    "2009": "Vinagre y Rosas",
+    "2017": "Lo Niego Todo",
+}
+
+root = Path(BASE_DIR) / ARTIST
+album_years = sorted([p.name for p in root.iterdir() if p.is_dir()])
+
+trend_rows = []
+trend_rows_norm = []
+png_files = []
+
+for year in album_years:
+    album_df = prepare_album(year, include_chorus=INCLUDE_CHORUS)
+    album_freqs = build_freqs_title_capped(album_df, max_per_song=3)
+
+    album_top  = filter_to_top_words(album_freqs, top_words)
+    album_norm = normalize_freqs_against_full(album_freqs, full_freqs, top_words)
+
+    trend_rows.append({"album_year": year, **album_top})
+    trend_rows_norm.append({"album_year": year, **album_norm})
+
+    png_path = PNG_DIR / f"sabina_{year}.png"
+    png_files.append(png_path)
+
+    album_title = ALBUM_TITLES.get(str(year), "")
+    display_title = f"Sabina — {year}\n{album_title}" if album_title else f"Sabina — {year}"
+    make_wordcloud(
+        freqs=album_top,
+        title=display_title,
+        mask=mask,
+        output_path=png_path,
+        size=900,
+    )
+
+# -------------------------
+# save trend tables
+# -------------------------
+trend_df      = pd.DataFrame(trend_rows).sort_values("album_year").reset_index(drop=True)
+trend_norm_df = pd.DataFrame(trend_rows_norm).sort_values("album_year").reset_index(drop=True)
+
+trend_df.to_csv(TREND_CSV, index=False)
+trend_norm_df.to_csv(TREND_NORMALIZED_CSV, index=False)
+
+print("Saved raw trend table to:", TREND_CSV)
+print("Saved normalized trend table to:", TREND_NORMALIZED_CSV)
+print("Saved legend to:", LEGEND_PATH)
+
+display(trend_df)
+display(trend_norm_df)
+
+# -------------------------
+# create GIF
+# -------------------------
+images = []
+for png in png_files:
+    if png.exists():
+        images.append(imageio.imread(png))
+
+if images:
+    # Ensure all frames are the same size (resize to match the first frame)
+    from PIL import Image as PilImage
+    target_size = (images[0].shape[1], images[0].shape[0])  # (width, height)
+    resized = []
+    for img in images:
+        if img.shape[:2] != images[0].shape[:2]:
+            pil_img = PilImage.fromarray(img)
+            pil_img = pil_img.resize(target_size, PilImage.LANCZOS)
+            resized.append(np.array(pil_img))
+        else:
+            resized.append(img)
+    imageio.mimsave(GIF_PATH, resized, duration=MILLISECONDS_PER_FRAME)
+    print("GIF created:", GIF_PATH)
+else:
+    print("No PNG files found, so GIF was not created.")
